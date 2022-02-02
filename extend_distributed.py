@@ -10,7 +10,6 @@ import sys
 import torch
 import torch.distributed as dist
 from torch.autograd import Function
-from torch.autograd.profiler import record_function
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
@@ -390,100 +389,96 @@ class All2All_Req(Function):
     @staticmethod
     def forward(ctx, a2a_info, *inputs):
         global myreq
-        with record_function("DLRM alltoall_req_fwd_single"):
-            batch_split_lengths = a2a_info.global_batch_partition_slices
-            if batch_split_lengths:
-                batch_split_lengths = [
-                    m * a2a_info.emb_dim * a2a_info.local_table_num
-                    for m in batch_split_lengths
-                ]
-            table_split_lengths = a2a_info.global_table_wise_parition_slices
-            if table_split_lengths:
-                table_split_lengths = [
-                    a2a_info.local_batch_num * e * a2a_info.emb_dim
-                    for e in table_split_lengths
-                ]
-            input = torch.cat(inputs, dim=1).view([-1])
-            output = input.new_empty(
-                [
-                    a2a_info.global_table_num
-                    * a2a_info.local_batch_num
-                    * a2a_info.emb_dim
-                ]
-            )
-            req = dist.all_to_all_single(
-                output, input, table_split_lengths, batch_split_lengths, async_op=True
-            )
+        batch_split_lengths = a2a_info.global_batch_partition_slices
+        if batch_split_lengths:
+            batch_split_lengths = [
+                m * a2a_info.emb_dim * a2a_info.local_table_num
+                for m in batch_split_lengths
+            ]
+        table_split_lengths = a2a_info.global_table_wise_parition_slices
+        if table_split_lengths:
+            table_split_lengths = [
+                a2a_info.local_batch_num * e * a2a_info.emb_dim
+                for e in table_split_lengths
+            ]
+        input = torch.cat(inputs, dim=1).view([-1])
+        output = input.new_empty(
+            [
+                a2a_info.global_table_num
+                * a2a_info.local_batch_num
+                * a2a_info.emb_dim
+            ]
+        )
+        req = dist.all_to_all_single(
+            output, input, table_split_lengths, batch_split_lengths, async_op=True
+        )
 
-            myreq.req = req
-            myreq.tensor = []
-            myreq.tensor.append(output)
-            myreq.tensor = tuple(myreq.tensor)
-            a2a_info.batch_split_lengths = batch_split_lengths
-            a2a_info.table_split_lengths = table_split_lengths
-            myreq.a2a_info = a2a_info
-            ctx.a2a_info = a2a_info
-            return myreq.tensor
+        myreq.req = req
+        myreq.tensor = []
+        myreq.tensor.append(output)
+        myreq.tensor = tuple(myreq.tensor)
+        a2a_info.batch_split_lengths = batch_split_lengths
+        a2a_info.table_split_lengths = table_split_lengths
+        myreq.a2a_info = a2a_info
+        ctx.a2a_info = a2a_info
+        return myreq.tensor
 
     @staticmethod
     def backward(ctx, *grad_output):
         global myreq
-        with record_function("DLRM alltoall_req_bwd_single"):
-            a2a_info = ctx.a2a_info
-            myreq.req.wait()
-            myreq.req = None
-            grad_input = myreq.tensor
-            grad_inputs = grad_input.view([a2a_info.batch_size, -1]).split(
-                a2a_info.emb_dim, dim=1
-            )
-            grad_inputs = [gin.contiguous() for gin in grad_inputs]
-            myreq.tensor = None
-            return (None, *grad_inputs)
+        a2a_info = ctx.a2a_info
+        myreq.req.wait()
+        myreq.req = None
+        grad_input = myreq.tensor
+        grad_inputs = grad_input.view([a2a_info.batch_size, -1]).split(
+            a2a_info.emb_dim, dim=1
+        )
+        grad_inputs = [gin.contiguous() for gin in grad_inputs]
+        myreq.tensor = None
+        return (None, *grad_inputs)
 
 
 class All2All_Wait(Function):
     @staticmethod
     def forward(ctx, *output):
         global myreq
-        with record_function("DLRM alltoall_wait_fwd_single"):
-            a2a_info = myreq.a2a_info
-            ctx.a2a_info = a2a_info
-            myreq.req.wait()
-            myreq.req = None
-            myreq.tensor = None
-            table_split_lengths = (
-                a2a_info.table_split_lengths
-                if a2a_info.table_split_lengths
-                else a2a_info.local_table_num
-                * a2a_info.local_batch_num
-                * a2a_info.emb_dim
-            )
-            outputs = output[0].split(table_split_lengths)
-            outputs = tuple(
-                [out.view([a2a_info.local_batch_num, -1]) for out in outputs]
-            )
-            return outputs
+        a2a_info = myreq.a2a_info
+        ctx.a2a_info = a2a_info
+        myreq.req.wait()
+        myreq.req = None
+        myreq.tensor = None
+        table_split_lengths = (
+            a2a_info.table_split_lengths
+            if a2a_info.table_split_lengths
+            else a2a_info.local_table_num
+            * a2a_info.local_batch_num
+            * a2a_info.emb_dim
+        )
+        outputs = output[0].split(table_split_lengths)
+        outputs = tuple(
+            [out.view([a2a_info.local_batch_num, -1]) for out in outputs]
+        )
+        return outputs
 
     @staticmethod
     def backward(ctx, *grad_outputs):
         global myreq
-        with record_function("DLRM alltoall_wait_bwd_single"):
-            a2a_info = ctx.a2a_info
-            grad_outputs = [gout.contiguous().view([-1]) for gout in grad_outputs]
-            grad_output = torch.cat(grad_outputs)
-            grad_input = grad_output.new_empty(
-                [a2a_info.batch_size * a2a_info.local_table_num * a2a_info.emb_dim]
-            )
-            req = dist.all_to_all_single(
-                grad_input,
-                grad_output,
-                a2a_info.batch_split_lengths,
-                a2a_info.table_split_lengths,
-                async_op=True,
-            )
-            myreq.req = req
-            myreq.tensor = grad_input
-            return (grad_output,)
+        a2a_info = ctx.a2a_info
+        grad_outputs = [gout.contiguous().view([-1]) for gout in grad_outputs]
+        grad_output = torch.cat(grad_outputs)
+        grad_input = grad_output.new_empty(
+            [a2a_info.batch_size * a2a_info.local_table_num * a2a_info.emb_dim]
+        )
+        req = dist.all_to_all_single(
+            grad_input,
+            grad_output,
+            a2a_info.batch_split_lengths,
+            a2a_info.table_split_lengths,
+            async_op=True,
+        )
+        myreq.req = req
+        myreq.tensor = grad_input
+        return (grad_output,)
 
 
 class AllGather(Function):
