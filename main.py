@@ -117,6 +117,26 @@ with warnings.catch_warnings():
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
+def create_graph(model, train_loader, summary, directory, use_gpu, device, ndevices):
+    """Given a model, creates and visualizes the computation DAG
+       of the model in the passed-in directory."""
+    graph_creator = torchgraph.GraphCreator(model, summary, module_whitelist=[])
+    graph_creator.hook_modules(model)
+    for i, model_input in enumerate(train_loader):
+        model_input = list(model_input)
+        for j in range(len(model_input)):
+            if j == 2:
+                model_input[j] = [input.cuda() for input in model_input[j]]
+            else:
+                model_input[j] = model_input[j].cuda()
+        X, lS_o, lS_i, T, W, CBPP = unpack_batch(model_input)
+        dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=ndevices)
+        if i >= 0:
+            break
+    graph_creator.unhook_modules()
+    graph_creator.persist_graph(directory)
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self):
@@ -1634,7 +1654,8 @@ def run():
         summary[-1]['forward_time'] = data_time
         summary[-1]['backward_time'] = 0.0
         summary[-1]['nb_params'] = 0.0
-        summary[-1]['output_shape'] = [args.batch_size] + list(model_input.size()[1:])
+        summary[-1]['output_shape'] = [args.mini_batch_size] + list(X.size()[1:])
+        create_graph(dlrm, train_ld, summary, './profiles', use_gpu, device, ndevices)
 
 
     ext_dist.barrier()
