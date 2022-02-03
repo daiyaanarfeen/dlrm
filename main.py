@@ -59,8 +59,16 @@ import argparse
 import builtins
 import datetime
 import json
-import sys
 import time
+import os
+from collections import OrderedDict
+
+import sys; sys.path = [".."] + sys.path
+import torchmodules.torchgraph as torchgraph
+import torchmodules.torchlogger as torchlogger
+import torchmodules.torchprofiler as torchprofiler
+import torchmodules.torchsummary as torchsummary
+
 
 # onnx
 # The onnx import causes deprecation warnings every time workers
@@ -107,6 +115,128 @@ with warnings.catch_warnings():
 # from torch.nn.parameter import Parameter
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def profile_train(model, train_loader, optimizer, use_gpu, device, ndevices):
+    batch_time_meter = AverageMeter()
+    data_time_meter = AverageMeter()
+    NUM_STEPS_TO_PROFILE = 1  # profile 100 steps or minibatches
+
+    layer_timestamps = []
+    data_times = []
+
+    iteration_timestamps = []
+    opt_step_timestamps = []
+    data_timestamps = []
+    
+    start_time = time.time()
+    for j, inputBatch in enumerate(train_loader):
+        inputBatch = list(inputBatch)
+        for k in range(len(inputBatch)):
+            if k == 2:
+                inputBatch[k] = [input.cuda() for input in inputBatch[k]]
+            else:
+                inputBatch[k] = inputBatch[k].cuda()
+        data_pid = os.getpid()
+        data_time = time.time() - start_time
+        data_time_meter.update(data_time)
+        with torchprofiler.Profiling(model, module_whitelist=[]) as p:
+            X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
+            t1 = time_wrap(use_gpu)
+            if ext_dist.my_size > 1 and X.size(0) % ext_dist.my_size != 0:
+                print(
+                    "Warning: Skiping the batch %d with size %d"
+                    % (j, X.size(0))
+                )
+                continue
+ 
+            mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+            Z = dlrm_wrap(
+                X,
+                lS_o,
+                lS_i,
+                use_gpu,
+                device,
+                ndevices=ndevices,
+            )
+
+            if ext_dist.my_size > 1:
+                T = T[ext_dist.get_my_slice(mbs)]
+                W = W[ext_dist.get_my_slice(mbs)]
+
+            # loss
+            E = loss_fn_wrap(Z, T, use_gpu, device)
+
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            E.backward()
+            optimizer_step_start = time.time()
+            optimizer.step()
+
+            end_time = time.time()
+            iteration_time = end_time - start_time
+            batch_time_meter.update(iteration_time)
+
+            if j >= NUM_STEPS_TO_PROFILE:
+                break
+        p_str = str(p)
+        layer_timestamps.append(p.processed_times())
+        data_times.append(data_time)
+
+        if args.verbose:
+            print('End-to-end time: {batch_time.val:.3f} s ({batch_time.avg:.3f} s)'.format(
+                  batch_time=batch_time_meter))
+
+        iteration_timestamps.append({"start": start_time * 1000 * 1000,
+                                     "duration": iteration_time * 1000 * 1000})
+        opt_step_timestamps.append({"start": optimizer_step_start * 1000 * 1000,
+                                    "duration": (end_time - optimizer_step_start) * 1000 * 1000, "pid": os.getpid()})
+        data_timestamps.append({"start":  start_time * 1000 * 1000,
+                                "duration": data_time * 1000 * 1000, "pid": data_pid})
+        
+        start_time = time.time()
+
+    layer_times = []
+    tot_accounted_time = 0.0
+    if args.verbose:
+        print("\n==========================================================")
+        print("Layer Type    Forward Time (ms)    Backward Time (ms)")
+        print("==========================================================")
+
+    for i in range(len(layer_timestamps[0])):
+        layer_type = str(layer_timestamps[0][i][0])
+        layer_forward_time_sum = 0.0
+        layer_backward_time_sum = 0.0
+        for j in range(len(layer_timestamps)):
+            layer_forward_time_sum += (layer_timestamps[j][i][2] / 1000)
+            layer_backward_time_sum += (layer_timestamps[j][i][5] / 1000)
+        layer_times.append((layer_type, layer_forward_time_sum / len(layer_timestamps),
+                                    layer_backward_time_sum / len(layer_timestamps)))
+        if args.verbose:
+            print(layer_times[-1][0], layer_times[-1][1], layer_times[-1][2])
+        tot_accounted_time += (layer_times[-1][1] + layer_times[-1][2])
+
+    print()
+    print("Total accounted time: %.3f ms" % tot_accounted_time)
+    return layer_times, (sum(data_times) * 1000.0) / len(data_times)
 
 
 def time_wrap(use_gpu):
@@ -991,6 +1121,8 @@ def run():
     parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
+    parser.add_argument("--verbose", action="store_true", default=False)
+    parser.add_argument("--profile", action="store_true", default=False)
 
     global args
     global nbatches
@@ -1466,6 +1598,44 @@ def run():
         mlperf_logger.log_event(key="sgd_opt_learning_rate_decay_poly_power", value=2)
 
     tb_file = "./" + args.tensor_board_filename
+
+
+    if args.profile:
+        print("Collecting profile...")
+        for i, model_input in enumerate(train_ld):
+            model_input = list(model_input)
+            for j in range(len(model_input)):
+                if j == 2:
+                    model_input[j] = [input.cuda() for input in model_input[j]]
+                else:
+                    model_input[j] = model_input[j].cuda()
+            if i >= 0:
+                break
+        X, lS_o, lS_i, T, W, CBPP = unpack_batch(model_input)
+        summary = torchsummary.summary(model=dlrm, module_whitelist=[], model_input=(X, lS_o, lS_i),
+                                       verbose=args.verbose, device="cuda")
+        per_layer_times, data_time = profile_train(dlrm, train_ld, optimizer, use_gpu, device, ndevices)
+        summary_i = 0
+        per_layer_times_i = 0
+        while summary_i < len(summary) and per_layer_times_i < len(per_layer_times):
+            summary_elem = summary[summary_i]
+            per_layer_time = per_layer_times[per_layer_times_i]
+            if str(summary_elem['layer_name']) != str(per_layer_time[0]):
+                summary_elem['forward_time'] = 0.0
+                summary_elem['backward_time'] = 0.0
+                summary_i += 1
+                continue
+            summary_elem['forward_time'] = per_layer_time[1]
+            summary_elem['backward_time'] = per_layer_time[2]
+            summary_i += 1
+            per_layer_times_i += 1
+        summary.append(OrderedDict())
+        summary[-1]['layer_name'] = 'Input'
+        summary[-1]['forward_time'] = data_time
+        summary[-1]['backward_time'] = 0.0
+        summary[-1]['nb_params'] = 0.0
+        summary[-1]['output_shape'] = [args.batch_size] + list(model_input.size()[1:])
+
 
     ext_dist.barrier()
     with torch.autograd.profiler.profile(
