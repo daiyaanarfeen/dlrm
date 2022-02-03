@@ -730,7 +730,10 @@ class DLRM_Net(nn.Module):
         #     print(y.detach().cpu().numpy())
 
         # interact features (dense and sparse)
-        z = self.interact_features(x, ly)
+        try:
+            z = self.interact_features(x, ly)
+        except:
+            z = self.interact_features(x.tensor, [y.tensor for y in ly])
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
