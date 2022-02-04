@@ -621,9 +621,15 @@ class DLRM_Net(nn.Module):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            if type(x) is torch.Tensor:
+                T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            else:
+                T = torchgraph.cat([x] + ly, 1).view((batch_size, -1, d))
             # perform a dot product
-            Z = torch.bmm(T, torch.transpose(T, 1, 2))
+            if type(T) is torch.Tensor:
+                Z = torch.bmm(T, torch.transpose(T, 1, 2))
+            else:
+                Z = torchgraph.bmm(T, T.transpose(1, 2))
             # append dense feature with the interactions (into a row vector)
             # approach 1: all
             # Zflat = Z.view((batch_size, -1))
@@ -731,10 +737,11 @@ class DLRM_Net(nn.Module):
 
         # interact features (dense and sparse)
         # HACK 
-        try:
-            z = self.interact_features(x, ly)
-        except:
-            z = self.interact_features(x.tensor, [y.tensor for y in ly])
+#        try:
+#            z = self.interact_features(x, ly)
+#        except:
+#            z = self.interact_features(x.tensor, [y.tensor for y in ly])
+        z = self.interact_features(x, ly)
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
