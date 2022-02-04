@@ -730,6 +730,7 @@ class DLRM_Net(nn.Module):
         #     print(y.detach().cpu().numpy())
 
         # interact features (dense and sparse)
+        # HACK 
         try:
             z = self.interact_features(x, ly)
         except:
