@@ -621,12 +621,12 @@ class DLRM_Net(nn.Module):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
-            if type(x) is torch.Tensor:
+            if isinstance(x, torch.Tensor):
                 T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
             else:
                 T = torchgraph.cat([x] + ly, 1).view((batch_size, -1, d))
             # perform a dot product
-            if type(T) is torch.Tensor:
+            if isinstance(T, torch.Tensor):
                 Z = torch.bmm(T, torch.transpose(T, 1, 2))
             else:
                 Z = torchgraph.bmm(T, T.transpose(1, 2))
@@ -644,7 +644,10 @@ class DLRM_Net(nn.Module):
             lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
             Zflat = Z[:, li, lj]
             # concatenate dense features and interactions
-            R = torch.cat([x] + [Zflat], dim=1)
+            if isinstance(x, torch.Tensor):
+                R = torch.cat([x] + [Zflat], dim=1)
+            else:
+                R = torchgraph.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
             R = torch.cat([x] + ly, dim=1)
